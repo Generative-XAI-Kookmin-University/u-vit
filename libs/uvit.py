@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import math
 from .timm import trunc_normal_, Mlp
 import einops
@@ -63,13 +64,38 @@ class Attention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.proj_drop = nn.Dropout(proj_drop)
 
-    def forward(self, x):
+    def forward(self, x, fam=None, fam_attn_w=0.025):
         B, L, C = x.shape
 
         qkv = self.qkv(x)
         if ATTENTION_MODE == 'flash':
             qkv = einops.rearrange(qkv, 'B L (K H D) -> K B H L D', K=3, H=self.num_heads).float()
             q, k, v = qkv[0], qkv[1], qkv[2]  # B H L D
+
+            if fam is not None:
+                if L == 257:  # time token
+                    extras = 1
+                elif L == 258:  # time token + label token
+                    extras = 2
+                else:
+                    extras = 1
+
+                num_patches = L - extras
+                patch_size = int(num_patches ** 0.5)
+
+                fam_resized = F.interpolate(fam.unsqueeze(0).unsqueeze(0), 
+                                          size=(patch_size, patch_size), 
+                                          mode='bilinear', align_corners=False)
+                fam_flat = fam_resized.flatten(2).transpose(1, 2)  # [1, num_patches, 1]
+                
+                fam_extras = torch.zeros(1, extras, 1, device=fam.device, dtype=fam.dtype)
+                fam_full = torch.cat([fam_extras, fam_flat], dim=1)  # [1, L, 1]
+                
+                fam_full = fam_full.expand(B, -1, -1).unsqueeze(1).expand(-1, self.num_heads, -1, -1)  # [B, H, L, 1]
+                
+                k = k * (1 + fam_attn_w * fam_full)
+                v = v * (1 + fam_attn_w * fam_full)
+
             x = torch.nn.functional.scaled_dot_product_attention(q, k, v)
             x = einops.rearrange(x, 'B H L D -> B L (H D)')
         elif ATTENTION_MODE == 'xformers':
@@ -106,16 +132,16 @@ class Block(nn.Module):
         self.skip_linear = nn.Linear(2 * dim, dim) if skip else None
         self.use_checkpoint = use_checkpoint
 
-    def forward(self, x, skip=None):
+    def forward(self, x, skip=None, fam=None, fam_attn_w=0.025):
         if self.use_checkpoint:
-            return torch.utils.checkpoint.checkpoint(self._forward, x, skip)
+            return torch.utils.checkpoint.checkpoint(self._forward, x, skip, fam, fam_attn_w)
         else:
-            return self._forward(x, skip)
+            return self._forward(x, skip, fam, fam_attn_w)
 
-    def _forward(self, x, skip=None):
+    def _forward(self, x, skip=None, fam=None, fam_attn_w=0.025):
         if self.skip_linear is not None:
             x = self.skip_linear(torch.cat([x, skip], dim=-1))
-        x = x + self.attn(self.norm1(x))
+        x = x + self.attn(self.norm1(x), fam=fam, fam_attn_w=fam_attn_w)
         x = x + self.mlp(self.norm2(x))
         return x
 
@@ -198,7 +224,7 @@ class UViT(nn.Module):
     def no_weight_decay(self):
         return {'pos_embed'}
 
-    def forward(self, x, timesteps, y=None):
+    def forward(self, x, timesteps, y=None, fam=None, fam_attn_w=0.025):
         x = self.patch_embed(x)
         B, L, D = x.shape
 
@@ -213,13 +239,13 @@ class UViT(nn.Module):
 
         skips = []
         for blk in self.in_blocks:
-            x = blk(x)
+            x = blk(x, fam=fam, fam_attn_w=fam_attn_w)
             skips.append(x)
 
         x = self.mid_block(x)
 
         for blk in self.out_blocks:
-            x = blk(x, skips.pop())
+            x = blk(x, skips.pop(), fam=fam, fam_attn_w=fam_attn_w)
 
         x = self.norm(x)
         x = self.decoder_pred(x)
