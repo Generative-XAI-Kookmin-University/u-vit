@@ -30,17 +30,6 @@ def generate_fam(model, dataset, flaw_highlighter, config, device, accelerator):
         samples = sde.euler_maruyama(sde.ODE(sde.ScoreModel(model, pred=config.pred, sde=sde.VPSDE())), 
                                        x_init=x_init, sample_steps=500, verbose=True)
         samples = (samples + 1) / 2  # [-1, 1] -> [0, 1]
-
-        # sample 저장
-        # if accelerator.is_main_process:
-        #     import os
-        #     from torchvision.utils import save_image
-            
-        #     fam_save_dir = os.path.join(config.sample_dir, 'fam_results')
-        #     os.makedirs(fam_save_dir, exist_ok=True)
-            
-        #     for idx, sample in enumerate(samples):
-        #         save_image(sample, os.path.join(fam_save_dir, f'sample_step_idx_{idx}.png'))
     
     flaw_maps = []
     # for img in samples:
@@ -257,10 +246,13 @@ def train(config):
         nnet.train()
         batch = tree_map(lambda x: x.to(device), next(data_generator))
 
+        # base phase
         if hasattr(config, 'fam') and train_state.step >= config.fam.first_process:
+            # cycle
             if train_state.step % config.fam.fam_cycle == 0:
-                current_fam = generate_fam(nnet_ema, dataset, flaw_highlighter, config, device, accelerator)
+                current_fam = generate_fam(nnet_ema, dataset, flaw_highlighter, config, device, accelerator) # flaw activation map generation
             metrics = train_step_with_fam(batch, current_fam, config.fam)
+        # refinement phase
         else:
             metrics = train_step(batch)
 

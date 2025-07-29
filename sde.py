@@ -282,8 +282,9 @@ def euler_maruyama(rsde, x_init, sample_steps, eps=1e-3, T=1, trace=None, verbos
 def LSimple(score_model: ScoreModel, x0, pred='noise_pred', fam=None, fam_noise_w=0.01, fam_attn_w=0.025, **kwargs):
     t, noise, xt = score_model.sde.sample(x0)
 
+    # self-refining forward process
     if fam is not None:
-        enhanced_noise = noise + fam_noise_w * fam
+        enhanced_noise = noise + fam_noise_w * fam # noise amplification
         noise = enhanced_noise
 
     if pred == 'noise_pred':

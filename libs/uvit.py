@@ -72,6 +72,7 @@ class Attention(nn.Module):
             qkv = einops.rearrange(qkv, 'B L (K H D) -> K B H L D', K=3, H=self.num_heads).float()
             q, k, v = qkv[0], qkv[1], qkv[2]  # B H L D
 
+            # self-refining reverse process (attention modulation)
             if fam is not None:
                 if L == 257:  # time token
                     extras = 1
@@ -93,6 +94,7 @@ class Attention(nn.Module):
                 
                 fam_full = fam_full.expand(B, -1, -1).unsqueeze(1).expand(-1, self.num_heads, -1, -1)  # [B, H, L, 1]
                 
+                # attention modulation
                 k = k * (1 + fam_attn_w * fam_full)
                 v = v * (1 + fam_attn_w * fam_full)
 
