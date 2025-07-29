@@ -14,9 +14,9 @@ def get_config():
 
     config.train = d(
         n_steps=500000,
-        batch_size=128,
+        batch_size=64,
         mode='uncond',
-        log_interval=10,
+        log_interval=1000,
         eval_interval=5000,
         save_interval=50000,
     )
@@ -47,8 +47,8 @@ def get_config():
     )
 
     config.dataset = d(
-        name='celeba',
-        path='assets/datasets/celeba',
+        name='celebahq',
+        path='../data/celeba_hq_256',
         resolution=64,
     )
 
@@ -58,6 +58,14 @@ def get_config():
         mini_batch_size=500,
         algorithm='euler_maruyama_sde',
         path=''
+    )
+
+    config.fam = d(
+        first_process=250000, 
+        fam_cycle=100,       
+        fam_noise_w=0.01, 
+        fam_attn_w=0.025,   
+        fh_path='./fh_ckpt/FH_best_24.pth'  
     )
 
     return config

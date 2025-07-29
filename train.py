@@ -1,6 +1,7 @@
 import sde
 import ml_collections
 import torch
+from torch import nn
 from torch import multiprocessing as mp
 from datasets import get_dataset
 from torchvision.utils import make_grid, save_image
@@ -17,6 +18,47 @@ from absl import logging
 import builtins
 import os
 import wandb
+
+def generate_fam(model, dataset, flaw_highlighter, config, device, accelerator):
+    from pytorch_grad_cam import GradCAM
+    from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
+    from torchvision.transforms.functional import normalize, resize
+    
+    with torch.no_grad():
+        x_init = torch.randn(config.train.batch_size, *dataset.data_shape, device=device)
+        
+        samples = sde.euler_maruyama(sde.ODE(sde.ScoreModel(model, pred=config.pred, sde=sde.VPSDE())), 
+                                       x_init=x_init, sample_steps=500, verbose=True)
+        samples = (samples + 1) / 2  # [-1, 1] -> [0, 1]
+    
+    flaw_maps = []
+    # for img in samples:
+    for idx, img in enumerate(samples):
+        input_tensor = normalize(resize(img, [64, 64]), [0.45, 0.45, 0.45], [0.25, 0.25, 0.25])
+        input_tensor = input_tensor.unsqueeze(0).to(device)
+        
+        target_layers = [layer for layer in flaw_highlighter.features if isinstance(layer, nn.Conv2d)][-1:]
+        
+        cam = GradCAM(model=flaw_highlighter, target_layers=target_layers)
+        cam.batch_size = 1
+        grayscale_cam = cam(input_tensor=input_tensor, targets=[ClassifierOutputTarget(0)])
+        flaw_map = torch.tensor(grayscale_cam[0]).to(device)
+        flaw_maps.append(flaw_map)
+        
+        # fam 저장
+        # if accelerator.is_main_process:
+        #     import os
+        #     from PIL import Image
+            
+        #     fam_save_dir = os.path.join(config.sample_dir, 'fam_results')
+        #     os.makedirs(fam_save_dir, exist_ok=True)
+            
+        #     fam_img = Image.fromarray((flaw_map.cpu().numpy() * 255).astype('uint8'))
+        #     fam_img.save(os.path.join(fam_save_dir, f'fam_{idx}.png'))
+        
+    mfam = torch.mean(torch.stack(flaw_maps), dim=0)
+    
+    return mfam
 
 
 def train(config):
@@ -95,6 +137,45 @@ def train(config):
         train_state.step += 1
         return dict(lr=train_state.optimizer.param_groups[0]['lr'], **_metrics)
 
+    def train_step_with_fam(batch, fam, fam_config):
+        metrics = dict()
+        optimizer.zero_grad()
+        
+        if config.train.mode == 'uncond':
+            loss = sde.LSimple(
+                score_model, 
+                batch, 
+                pred=config.pred, 
+                fam=fam, 
+                fam_noise_w=fam_config.fam_noise_w,
+                fam_attn_w=fam_config.fam_attn_w
+            )
+        elif config.train.mode == 'cond':
+            loss = sde.LSimple(
+                score_model, 
+                batch[0], 
+                pred=config.pred, 
+                y=batch[1], 
+                fam=fam, 
+                fam_noise_w=fam_config.fam_noise_w,
+                fam_attn_w=fam_config.fam_attn_w
+            )
+        else:
+            raise NotImplementedError(config.train.mode)
+        
+        metrics['loss'] = loss.mean()
+        loss.mean().backward()
+        
+        if 'grad_clip' in config and config.grad_clip > 0:
+            torch.nn.utils.clip_grad_norm_(nnet.parameters(), max_norm=config.grad_clip)
+        
+        optimizer.step()
+        lr_scheduler.step()
+        train_state.ema_update(config.get('ema_rate', 0.9999))
+        train_state.step += 1
+        
+        return dict(lr=optimizer.param_groups[0]['lr'], **metrics)
+
 
     def eval_step(n_samples, sample_steps, algorithm):
         logging.info(f'eval_step: n_samples={n_samples}, sample_steps={sample_steps}, algorithm={algorithm}, '
@@ -152,11 +233,28 @@ def train(config):
 
     logging.info(f'Start fitting, step={train_state.step}, mixed_precision={config.mixed_precision}')
 
+    if hasattr(config, 'fam'):
+        from libs.flaw_highlighter import FlawHighlighter
+        flaw_highlighter = FlawHighlighter(params={'nc': 3, 'ndf': 32})
+        fh_ckpt = torch.load(config.fam.fh_path)
+        flaw_highlighter.load_state_dict(fh_ckpt['model_state_dict'])
+        flaw_highlighter.eval()
+        current_fam = None
+
     step_fid = []
     while train_state.step < config.train.n_steps:
         nnet.train()
         batch = tree_map(lambda x: x.to(device), next(data_generator))
-        metrics = train_step(batch)
+
+        # base phase
+        if hasattr(config, 'fam') and train_state.step >= config.fam.first_process:
+            # cycle
+            if train_state.step % config.fam.fam_cycle == 0:
+                current_fam = generate_fam(nnet_ema, dataset, flaw_highlighter, config, device, accelerator) # flaw activation map generation
+            metrics = train_step_with_fam(batch, current_fam, config.fam)
+        # refinement phase
+        else:
+            metrics = train_step(batch)
 
         nnet.eval()
         if accelerator.is_main_process and train_state.step % config.train.log_interval == 0:

@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from absl import logging
 import numpy as np
 import math
@@ -165,16 +166,16 @@ class ScoreModel(object):
         self.T = T
         print(f'ScoreModel with pred={pred}, sde={sde}, T={T}')
 
-    def predict(self, xt, t, **kwargs):
+    def predict(self, xt, t, fam=None, fam_attn_w=0.025,**kwargs):
         if not isinstance(t, torch.Tensor):
             t = torch.tensor(t)
         t = t.to(xt.device)
         if t.dim() == 0:
             t = duplicate(t, xt.size(0))
-        return self.nnet(xt, t * 999, **kwargs)  # follow SDE
+        return self.nnet(xt, t * 999, fam=fam, fam_attn_w=fam_attn_w, **kwargs)  # follow SDE
 
-    def noise_pred(self, xt, t, **kwargs):
-        pred = self.predict(xt, t, **kwargs)
+    def noise_pred(self, xt, t, fam=None, fam_attn_w=0.025, **kwargs):
+        pred = self.predict(xt, t, fam=fam, fam_attn_w=fam_attn_w, **kwargs)
         if self.pred == 'noise_pred':
             noise_pred = pred
         elif self.pred == 'x0_pred':
@@ -183,8 +184,8 @@ class ScoreModel(object):
             raise NotImplementedError
         return noise_pred
 
-    def x0_pred(self, xt, t, **kwargs):
-        pred = self.predict(xt, t, **kwargs)
+    def x0_pred(self, xt, t, fam=None, fam_attn_w=0.025, **kwargs):
+        pred = self.predict(xt, t, fam=fam, fam_attn_w=fam_attn_w, **kwargs)
         if self.pred == 'noise_pred':
             x0_pred = stp(self.sde.cum_alpha(t).rsqrt(), xt) - stp(self.sde.nsr(t).sqrt(), pred)
         elif self.pred == 'x0_pred':
@@ -193,9 +194,9 @@ class ScoreModel(object):
             raise NotImplementedError
         return x0_pred
 
-    def score(self, xt, t, **kwargs):
+    def score(self, xt, t, fam=None, fam_attn_w=0.025, **kwargs):
         cum_beta = self.sde.cum_beta(t)
-        noise_pred = self.noise_pred(xt, t, **kwargs)
+        noise_pred = self.noise_pred(xt, t, fam=fam, fam_attn_w=fam_attn_w, **kwargs)
         return stp(-cum_beta.rsqrt(), noise_pred)
 
 
@@ -267,13 +268,30 @@ def euler_maruyama(rsde, x_init, sample_steps, eps=1e-3, T=1, trace=None, verbos
     return x
 
 
-def LSimple(score_model: ScoreModel, x0, pred='noise_pred', **kwargs):
+# def LSimple(score_model: ScoreModel, x0, pred='noise_pred', **kwargs):
+#     t, noise, xt = score_model.sde.sample(x0)
+#     if pred == 'noise_pred':
+#         noise_pred = score_model.noise_pred(xt, t, **kwargs)
+#         return mos(noise - noise_pred)
+#     elif pred == 'x0_pred':
+#         x0_pred = score_model.x0_pred(xt, t, **kwargs)
+#         return mos(x0 - x0_pred)
+#     else:
+#         raise NotImplementedError(pred)
+
+def LSimple(score_model: ScoreModel, x0, pred='noise_pred', fam=None, fam_noise_w=0.01, fam_attn_w=0.025, **kwargs):
     t, noise, xt = score_model.sde.sample(x0)
+
+    # self-refining forward process
+    if fam is not None:
+        enhanced_noise = noise + fam_noise_w * fam # noise amplification
+        noise = enhanced_noise
+
     if pred == 'noise_pred':
-        noise_pred = score_model.noise_pred(xt, t, **kwargs)
+        noise_pred = score_model.noise_pred(xt, t, fam=fam, fam_attn_w=fam_attn_w, **kwargs)
         return mos(noise - noise_pred)
     elif pred == 'x0_pred':
-        x0_pred = score_model.x0_pred(xt, t, **kwargs)
+        x0_pred = score_model.x0_pred(xt, t, fam=fam, fam_attn_w=fam_attn_w, **kwargs)
         return mos(x0 - x0_pred)
     else:
         raise NotImplementedError(pred)
